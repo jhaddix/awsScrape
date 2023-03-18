@@ -17,7 +17,7 @@ Run the script as follows:
 go run awsscrape.go -keyword=<KEYWORD>  
 ```
 
-Replace "example" with the keyword you want to search for in the SSL certificates.
+Replace <KEYWORD> with the keyword you want to search for in the SSL certificates.
 
 The script will parse the SSL certificates from the AWS IP ranges and display any matching your KEYWORD with the IP addresses of the matching certificates.
 
