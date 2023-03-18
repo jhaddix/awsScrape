@@ -14,7 +14,7 @@ cd awsscrape
 Run the script as follows:
 
 ```
-python awsscrape.py --keyword "example"
+go run awsGO.go -keyword=<KEYWORD>  
 ```
 
 Replace "example" with the keyword you want to search for in the SSL certificates.
