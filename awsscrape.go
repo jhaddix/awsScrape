@@ -55,7 +55,12 @@ func main() {
 			log.Println("Error reading wordlist file:", err)
 			return
 		}
-		keywordList = strings.Split(string(keywords), "\n")
+		lines := strings.Split(string(keywords), "\n")
+		for _, line := range lines {
+			if len(strings.TrimSpace(line)) > 0 {
+				keywordList = append(keywordList, line)
+			}
+		}
 	} else {
 		keywordList = []string{keyword}
 	}
