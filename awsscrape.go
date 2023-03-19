@@ -1,23 +1,17 @@
 package main
 
 import (
-	"bufio"
-	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 )
 
 type IPRange struct {
@@ -26,94 +20,139 @@ type IPRange struct {
 	} `json:"prefixes"`
 }
 
-const (
-	defaultTimeout = 10 * time.Second
-)
-
-var (
-	logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds)
-
-	// Flags
-	wordlistFileFlag = flag.String("wordlistFile", "", "Path to a file containing one word per line")
-	timeoutFlag      = flag.Duration("timeout", defaultTimeout, "Timeout for network operations")
-	threadsFlag      = flag.Int("threads", 1, "Number of concurrent threads to use")
-)
-
-type CheckIPRangeError struct {
-	IPRange string
-	Err     error
+type checkIPRangeParams struct {
+	ipRange     string
+	keywordList []string
+	timeout     int
 }
 
-func (e CheckIPRangeError) Error() string {
-	return fmt.Sprintf("error checking IP range %s: %v", e.IPRange, e.Err)
+func parseCommandLineArguments() (string, string, int, int) {
+	wordlist := flag.String("wordlist", "", "File containing keywords to search in SSL certificates")
+	keyword := flag.String("keyword", "", "Single keyword to search in SSL certificates")
+	numThreads := flag.Int("threads", 4, "Number of concurrent threads")
+	timeout := flag.Int("timeout", 1, "Timeout in seconds for SSL connection")
+	flag.Parse()
+
+	return *wordlist, *keyword, *numThreads, *timeout
 }
 
 func main() {
-	flag.Parse()
+	wordlist, keyword, numThreads, timeout := parseCommandLineArguments()
 
-	if *wordlistFileFlag == "" {
-		fmt.Printf("Usage: %s -wordlistFile=<path_to_wordlist_file>\n", os.Args[0])
-		os.Exit(1)
+	if wordlist == "" && keyword == "" {
+		fmt.Println("Usage: go run script.go [-wordlist=<your_keywords_file> | -keyword=<your_keyword>] [-threads=<num_threads>] [-timeout=<timeout_seconds>]")
+		return
 	}
 
-	wordlist, err := readWordlist(*wordlistFileFlag)
-	if err != nil {
-		logger.Fatalf("Error reading wordlist file: %v", err)
-	}
-
-	ipRanges, err := getIPRanges()
-	if err != nil {
-		logger.Fatalf("Error fetching IP ranges: %v", err)
-	}
-
-	ipAddresses := &sync.Map{}
-	eg := &errgroup.Group{}
-	ctx, cancel := context.WithTimeout(context.Background(), *timeoutFlag)
-	defer cancel()
-
-	threadCount := *threadsFlag
-	if threadCount <= 0 {
-		threadCount = 1
-	}
-	rangeCount := len(ipRanges.Prefixes)
-	rangesPerThread := (rangeCount + threadCount - 1) / threadCount
-
-	for i := 0; i < rangeCount; i += rangesPerThread {
-		start := i
-		end := i + rangesPerThread
-		if end > rangeCount {
-			end = rangeCount
+	var keywordList []string
+	if wordlist != "" {
+		keywords, err := ioutil.ReadFile(wordlist)
+		if err != nil {
+			log.Println("Error reading wordlist file:", err)
+			return
 		}
-		eg.Go(func() error {
-			for j := start; j < end; j++ {
-				err := checkIPRange(ctx, ipRanges.Prefixes[j].IPPrefix, wordlist, ipAddresses)
-				if err != nil {
-					return CheckIPRangeError{ipRanges.Prefixes[j].IPPrefix, err}
-				}
+		keywordList = strings.Split(string(keywords), "\n")
+	} else {
+		keywordList = []string{keyword}
+	}
+
+	resp, err := http.Get("https://ip-ranges.amazonaws.com/ip-ranges.json")
+	if err != nil {
+		log.Println("Error fetching IP ranges:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Println("Error reading response body:", err)
+		return
+	}
+
+	var ipRanges IPRange
+	err = json.Unmarshal(data, &ipRanges)
+	if err != nil {
+		log.Println("Error parsing JSON:", err)
+		return
+	}
+
+	ipChan := make(chan string)
+	jobChan := make(chan checkIPRangeParams, numThreads)
+
+	var wg sync.WaitGroup
+	wg.Add(numThreads)
+
+	for i := 0; i < numThreads; i++ {
+		go func() {
+			defer wg.Done()
+			for params := range jobChan {
+				checkIPRange(params, ipChan)
 			}
-			return nil
-		})
+		}()
 	}
 
-	if err := eg.Wait(); err != nil {
-		logger.Fatalf("%v", err)
-	}
+	go func() {
+		for _, prefix := range ipRanges.Prefixes {
+			params := checkIPRangeParams{
+				ipRange:     prefix.IPPrefix,
+				keywordList: keywordList,
+				timeout:     timeout,
+			}
+			jobChan <- params
+		}
+		close(jobChan)
+	}()
 
-	ipAddresses.Range(func(key, value interface{}) bool {
-		matchedWords := value.([]string)
-		logger.Printf("Word(s) found in SSL certificate for IP: %s\nMatched wordlist: %v\n", key, matchedWords)
-		return true
-	})
+	go func() {
+		wg.Wait()
+		close(ipChan)
+	}()
+
+	for ip := range ipChan {
+		fmt.Printf("Matched keyword found in SSL certificate for IP: %s\n", ip)
+	}
 }
 
-func readWordlist(file string) ([]string, error) {
-	f, err := os.Open(file)
+func checkIPRange(params checkIPRangeParams, ipChan chan<- string) {
+	_, ipNet, err := net.ParseCIDR(params.ipRange)
 	if err != nil {
-		return nil, fmt.Errorf("error opening wordlist file: %w", err)
+		return
 	}
-	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	var wordlist []string
-	for scanner.Scan() {
-		word := strings
+	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
+		for _, keyword := range params.keywordList {
+			if checkSSLKeyword(ip.String(), keyword, params.timeout) {
+				ipChan <- fmt.Sprintf("%s (Keyword: %s)", ip.String(), keyword)
+			}
+		}
+	}
+}
+
+func checkSSLKeyword(ip, keyword string, timeout int) bool {
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: time.Duration(timeout) * time.Second}, "tcp", ip+":443", &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) > 0 {
+		subject := certs[0].Subject
+		if strings.Contains(subject.CommonName, keyword) ||
+			strings.Contains(strings.Join(subject.Organization, " "), keyword) ||
+			strings.Contains(strings.Join(subject.OrganizationalUnit, " "), keyword) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func incrementIP(ip net.IP) {
+	for i := len(ip) - 1; i >= 0; i-- {
+		ip[i]++
+		if ip[i] != 0 {
+			break
+		}
+	}
+}
