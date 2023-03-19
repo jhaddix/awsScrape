@@ -1,16 +1,23 @@
-
 package main
 
 import (
+	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type IPRange struct {
@@ -19,94 +26,94 @@ type IPRange struct {
 	} `json:"prefixes"`
 }
 
+const (
+	defaultTimeout = 10 * time.Second
+)
+
+var (
+	logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds)
+
+	// Flags
+	wordlistFileFlag = flag.String("wordlistFile", "", "Path to a file containing one word per line")
+	timeoutFlag      = flag.Duration("timeout", defaultTimeout, "Timeout for network operations")
+	threadsFlag      = flag.Int("threads", 1, "Number of concurrent threads to use")
+)
+
+type CheckIPRangeError struct {
+	IPRange string
+	Err     error
+}
+
+func (e CheckIPRangeError) Error() string {
+	return fmt.Sprintf("error checking IP range %s: %v", e.IPRange, e.Err)
+}
+
 func main() {
-	keyword := flag.String("keyword", "", "Keyword to search in SSL certificates")
 	flag.Parse()
 
-	if *keyword == "" {
-		fmt.Println("Usage: go run script.go -keyword=<your_keyword>")
-		return
+	if *wordlistFileFlag == "" {
+		fmt.Printf("Usage: %s -wordlistFile=<path_to_wordlist_file>\n", os.Args[0])
+		os.Exit(1)
 	}
 
-	resp, err := http.Get("https://ip-ranges.amazonaws.com/ip-ranges.json")
+	wordlist, err := readWordlist(*wordlistFileFlag)
 	if err != nil {
-		fmt.Println("Error fetching IP ranges:", err)
-		return
+		logger.Fatalf("Error reading wordlist file: %v", err)
 	}
-	defer resp.Body.Close()
 
-	data, err := ioutil.ReadAll(resp.Body)
+	ipRanges, err := getIPRanges()
 	if err != nil {
-		fmt.Println("Error reading response body:", err)
-		return
+		logger.Fatalf("Error fetching IP ranges: %v", err)
 	}
 
-	var ipRanges IPRange
-	err = json.Unmarshal(data, &ipRanges)
-	if err != nil {
-		fmt.Println("Error parsing JSON:", err)
-		return
+	ipAddresses := &sync.Map{}
+	eg := &errgroup.Group{}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeoutFlag)
+	defer cancel()
+
+	threadCount := *threadsFlag
+	if threadCount <= 0 {
+		threadCount = 1
 	}
+	rangeCount := len(ipRanges.Prefixes)
+	rangesPerThread := (rangeCount + threadCount - 1) / threadCount
 
-	var wg sync.WaitGroup
-	ipChan := make(chan string)
-
-	for _, prefix := range ipRanges.Prefixes {
-		wg.Add(1)
-		go func(ipRange string) {
-			defer wg.Done()
-			checkIPRange(ipRange, *keyword, ipChan)
-		}(prefix.IPPrefix)
-	}
-
-	go func() {
-		wg.Wait()
-		close(ipChan)
-	}()
-
-	for ip := range ipChan {
-		fmt.Printf("Keyword found in SSL certificate for IP: %s\n", ip)
-	}
-}
-
-func checkIPRange(ipRange, keyword string, ipChan chan<- string) {
-	_, ipNet, err := net.ParseCIDR(ipRange)
-	if err != nil {
-		return
-	}
-
-	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
-		if checkSSLKeyword(ip.String(), keyword) {
-			ipChan <- ip.String()
+	for i := 0; i < rangeCount; i += rangesPerThread {
+		start := i
+		end := i + rangesPerThread
+		if end > rangeCount {
+			end = rangeCount
 		}
+		eg.Go(func() error {
+			for j := start; j < end; j++ {
+				err := checkIPRange(ctx, ipRanges.Prefixes[j].IPPrefix, wordlist, ipAddresses)
+				if err != nil {
+					return CheckIPRangeError{ipRanges.Prefixes[j].IPPrefix, err}
+				}
+			}
+			return nil
+		})
 	}
+
+	if err := eg.Wait(); err != nil {
+		logger.Fatalf("%v", err)
+	}
+
+	ipAddresses.Range(func(key, value interface{}) bool {
+		matchedWords := value.([]string)
+		logger.Printf("Word(s) found in SSL certificate for IP: %s\nMatched wordlist: %v\n", key, matchedWords)
+		return true
+	})
 }
 
-func checkSSLKeyword(ip, keyword string) bool {
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 1e9}, "tcp", ip+":443", &tls.Config{InsecureSkipVerify: true})
+func readWordlist(file string) ([]string, error) {
+	f, err := os.Open(file)
 	if err != nil {
-		return false
+		return nil, fmt.Errorf("error opening wordlist file: %w", err)
 	}
-	defer conn.Close()
+	defer f.Close()
 
-	certs := conn.ConnectionState().PeerCertificates
-	if len(certs) > 0 {
-		subject := certs[0].Subject
-		if strings.Contains(subject.CommonName, keyword) ||
-			strings.Contains(strings.Join(subject.Organization, " "), keyword) ||
-			strings.Contains(strings.Join(subject.OrganizationalUnit, " "), keyword) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func incrementIP(ip net.IP) {
-	for i := len(ip) - 1; i >= 0; i-- {
-		ip[i]++
-		if ip[i] != 0 {
-			break
-		}
-	}
-}
+	scanner := bufio.NewScanner(f)
+	var wordlist []string
+	for scanner.Scan() {
+		word := strings
