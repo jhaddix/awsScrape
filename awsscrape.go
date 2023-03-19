@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -26,21 +28,23 @@ type checkIPRangeParams struct {
 	timeout     int
 }
 
-func parseCommandLineArguments() (string, string, int, int) {
+func parseCommandLineArguments() (string, string, int, int, bool, string) {
 	wordlist := flag.String("wordlist", "", "File containing keywords to search in SSL certificates")
 	keyword := flag.String("keyword", "", "Single keyword to search in SSL certificates")
 	numThreads := flag.Int("threads", 4, "Number of concurrent threads")
 	timeout := flag.Int("timeout", 1, "Timeout in seconds for SSL connection")
+	randomize := flag.Bool("randomize", false, "Randomize the order in which IP addresses are checked")
+	outputFile := flag.String("output", "", "Output file to save results")
 	flag.Parse()
 
-	return *wordlist, *keyword, *numThreads, *timeout
+	return *wordlist, *keyword, *numThreads, *timeout, *randomize, *outputFile
 }
 
 func main() {
-	wordlist, keyword, numThreads, timeout := parseCommandLineArguments()
+	wordlist, keyword, numThreads, timeout, randomize, outputFile := parseCommandLineArguments()
 
 	if wordlist == "" && keyword == "" {
-		fmt.Println("Usage: go run script.go [-wordlist=<your_keywords_file> | -keyword=<your_keyword>] [-threads=<num_threads>] [-timeout=<timeout_seconds>]")
+		fmt.Println("Usage: go run script.go [-wordlist=<your_keywords_file> | -keyword=<your_keyword>] [-threads=<num_threads>] [-timeout=<timeout_seconds>] [-randomize] [-output=<output_file>]")
 		return
 	}
 
@@ -76,6 +80,13 @@ func main() {
 		return
 	}
 
+	if randomize {
+		rand.Seed(time.Now().UnixNano())
+		rand.Shuffle(len(ipRanges.Prefixes), func(i, j int) {
+			ipRanges.Prefixes[i], ipRanges.Prefixes[j] = ipRanges.Prefixes[j], ipRanges.Prefixes[i]
+		})
+	}
+
 	ipChan := make(chan string)
 	jobChan := make(chan checkIPRangeParams, numThreads)
 
@@ -108,8 +119,25 @@ func main() {
 		close(ipChan)
 	}()
 
+	var output *os.File
+	if outputFile != "" {
+		output, err = os.Create(outputFile)
+		if err != nil {
+			log.Println("Error creating output file:", err)
+			return
+		}
+		defer output.Close()
+	}
+
 	for ip := range ipChan {
-		fmt.Printf("Matched keyword found in SSL certificate for IP: %s\n", ip)
+		result := fmt.Sprintf("Matched keyword found in SSL certificate for IP: %s\n", ip)
+		fmt.Print(result)
+		if output != nil {
+			_, err := output.WriteString(result)
+			if err != nil {
+				log.Println("Error writing to output file:", err)
+			}
+		}
 	}
 }
 
