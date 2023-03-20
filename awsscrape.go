@@ -26,25 +26,33 @@ type checkIPRangeParams struct {
 	ipRange     string
 	keywordList []string
 	timeout     int
+	verbose     bool
 }
 
-func parseCommandLineArguments() (string, string, int, int, bool, string) {
+func parseCommandLineArguments() (string, string, int, int, bool, string, bool) {
 	wordlist := flag.String("wordlist", "", "File containing keywords to search in SSL certificates")
+	shortWordlist := flag.String("w", "", "File containing keywords to search in SSL certificates (short form)")
 	keyword := flag.String("keyword", "", "Single keyword to search in SSL certificates")
 	numThreads := flag.Int("threads", 4, "Number of concurrent threads")
 	timeout := flag.Int("timeout", 1, "Timeout in seconds for SSL connection")
 	randomize := flag.Bool("randomize", false, "Randomize the order in which IP addresses are checked")
 	outputFile := flag.String("output", "", "Output file to save results")
+	verbose := flag.Bool("verbose", false, "Enable verbose mode")
+	flag.BoolVar(verbose, "v", false, "Enable verbose mode (short form)")
 	flag.Parse()
 
-	return *wordlist, *keyword, *numThreads, *timeout, *randomize, *outputFile
+	if *wordlist == "" && *shortWordlist != "" {
+		*wordlist = *shortWordlist
+	}
+
+	return *wordlist, *keyword, *numThreads, *timeout, *randomize, *outputFile, *verbose
 }
 
 func main() {
-	wordlist, keyword, numThreads, timeout, randomize, outputFile := parseCommandLineArguments()
+	wordlist, keyword, numThreads, timeout, randomize, outputFile, verbose := parseCommandLineArguments()
 
 	if wordlist == "" && keyword == "" {
-		fmt.Println("Usage: go run script.go [-wordlist=<your_keywords_file> | -keyword=<your_keyword>] [-threads=<num_threads>] [-timeout=<timeout_seconds>] [-randomize] [-output=<output_file>]")
+		fmt.Println("Usage: go run script.go [-wordlist=<your_keywords_file> | -keyword=<your_keyword>] [-threads=<num_threads>] [-timeout=<timeout_seconds>] [-randomize] [-output=<output_file>] [-verbose]")
 		return
 	}
 
@@ -113,6 +121,7 @@ func main() {
 				ipRange:     prefix.IPPrefix,
 				keywordList: keywordList,
 				timeout:     timeout,
+				verbose:     verbose,
 			}
 			jobChan <- params
 		}
@@ -135,10 +144,9 @@ func main() {
 	}
 
 	for ip := range ipChan {
-		result := fmt.Sprintf("Matched keyword found in SSL certificate for IP: %s\n", ip)
-		fmt.Print(result)
+		fmt.Print(ip)
 		if output != nil {
-			_, err := output.WriteString(result)
+			_, err := output.WriteString(ip)
 			if err != nil {
 				log.Println("Error writing to output file:", err)
 			}
@@ -153,9 +161,26 @@ func checkIPRange(params checkIPRangeParams, ipChan chan<- string) {
 	}
 
 	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
+		found := false
+		matchedKeywords := []string{}
 		for _, keyword := range params.keywordList {
 			if checkSSLKeyword(ip.String(), keyword, params.timeout) {
-				ipChan <- fmt.Sprintf("%s (Keyword: %s)", ip.String(), keyword)
+				matchedKeywords = append(matchedKeywords, keyword)
+				found = true
+			}
+		}
+
+		if found {
+			if len(matchedKeywords) > 20 {
+				ipChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(matchedKeywords))
+			} else {
+				ipChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(matchedKeywords, ", "))
+			}
+		} else if params.verbose {
+			if len(params.keywordList) > 20 {
+				ipChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(params.keywordList))
+			} else {
+				ipChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(params.keywordList, ", "))
 			}
 		}
 	}
