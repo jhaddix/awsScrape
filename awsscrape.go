@@ -29,27 +29,32 @@ type checkIPRangeParams struct {
 	verbose     bool
 }
 
-func parseCommandLineArguments() (string, string, int, int, bool, string, bool) {
-	wordlist := flag.String("wordlist", "", "File containing keywords to search in SSL certificates")
-	shortWordlist := flag.String("w", "", "File containing keywords to search in SSL certificates (short form)")
-	keyword := flag.String("keyword", "", "Single keyword to search in SSL certificates")
-	numThreads := flag.Int("threads", 4, "Number of concurrent threads")
-	timeout := flag.Int("timeout", 1, "Timeout in seconds for SSL connection")
-	randomize := flag.Bool("randomize", false, "Randomize the order in which IP addresses are checked")
-	outputFile := flag.String("output", "", "Output file to save results")
-	verbose := flag.Bool("verbose", false, "Enable verbose mode")
-	flag.BoolVar(verbose, "v", false, "Enable verbose mode (short form)")
+var (
+	wordlist   string
+	keyword    string
+	numThreads int
+	timeout    int
+	randomize  bool
+	outputFile string
+	verbose    bool
+)
+
+func parseCommandLineArguments() {
+	flag.StringVar(&wordlist, "wordlist", "", "File containing keywords to search in SSL certificates")
+	flag.StringVar(&wordlist, "w", "", "File containing keywords to search in SSL certificates (short form)")
+	flag.StringVar(&keyword, "keyword", "", "Single keyword to search in SSL certificates")
+	flag.IntVar(&numThreads, "threads", 4, "Number of concurrent threads")
+	flag.IntVar(&timeout, "timeout", 1, "Timeout in seconds for SSL connection")
+	flag.BoolVar(&randomize, "randomize", false, "Randomize the order in which IP addresses are checked")
+	flag.StringVar(&outputFile, "output", "", "Output file to save results")
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose mode")
+	flag.BoolVar(&verbose, "v", false, "Enable verbose mode (short form)")
+
 	flag.Parse()
-
-	if *wordlist == "" && *shortWordlist != "" {
-		*wordlist = *shortWordlist
-	}
-
-	return *wordlist, *keyword, *numThreads, *timeout, *randomize, *outputFile, *verbose
 }
 
 func main() {
-	wordlist, keyword, numThreads, timeout, randomize, outputFile, verbose := parseCommandLineArguments()
+	parseCommandLineArguments()
 
 	if wordlist == "" && keyword == "" {
 		fmt.Println("Usage: go run script.go [-wordlist=<your_keywords_file> | -keyword=<your_keyword>] [-threads=<num_threads>] [-timeout=<timeout_seconds>] [-randomize] [-output=<output_file>] [-verbose]")
