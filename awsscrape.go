@@ -73,10 +73,14 @@ func main() {
 	if prefixesInputFile != "" {
 		prefixes, err = readFileLines(prefixesInputFile)
 	} else {
-		prefixes, err = getAWSIpRangePrefixes(randomize)
+		prefixes, err = getAWSIpRangePrefixes()
 	}
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	if randomize {
+		randomizeStrings(prefixes)
 	}
 
 	checker := newChecker(timeout, NewRegexFinder(keywordList))
@@ -232,7 +236,7 @@ func (r *regexFinder) Keywords() []string {
 	return r.keywods
 }
 
-func getAWSIpRangePrefixes(randomize bool) ([]string, error) {
+func getAWSIpRangePrefixes() ([]string, error) {
 	type IPRange struct {
 		Prefixes []struct {
 			IPPrefix string `json:"ip_prefix"`
@@ -261,14 +265,14 @@ func getAWSIpRangePrefixes(randomize bool) ([]string, error) {
 		prefixes[i] = p.IPPrefix
 	}
 
-	if randomize {
-		rand.Seed(time.Now().UnixNano())
-		rand.Shuffle(len(prefixes), func(i, j int) {
-			prefixes[i], prefixes[j] = prefixes[j], prefixes[i]
-		})
-	}
-
 	return prefixes, nil
+}
+
+func randomizeStrings(s []string) {
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(s), func(i, j int) {
+		s[i], s[j] = s[j], s[i]
+	})
 }
 
 func readFileLines(filePath string) ([]string, error) {
