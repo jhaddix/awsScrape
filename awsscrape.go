@@ -152,7 +152,9 @@ func (c *cidrChecker) checkIPRange(ipRange string, logChan chan<- string) {
 	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
 		matchedKeywords, err := c.checkSSLKeywords(ip.String())
 		if err != nil {
-			// TODO: check timeout error
+			if verbose {
+				fmt.Fprintln(os.Stderr, "Error in tls handshake:", err)
+			}
 			continue
 		}
 
