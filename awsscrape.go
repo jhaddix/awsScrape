@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,22 +13,15 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
 
-type IPRange struct {
-	Prefixes []struct {
-		IPPrefix string `json:"ip_prefix"`
-	} `json:"prefixes"`
-}
-
-type checkIPRangeParams struct {
-	ipRange     string
-	keywordList []string
-	timeout     int
-	verbose     bool
+type KeywordFinder interface {
+	FindKeywords(string) []string
+	Keywords() []string
 }
 
 var (
@@ -85,8 +79,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ipChan := make(chan string)
-	jobChan := make(chan checkIPRangeParams, numThreads)
+	checker := newChecker(timeout, NewRegexFinder(keywordList))
+
+	logChan := make(chan string)
+	jobChan := make(chan string, numThreads)
 
 	var wg sync.WaitGroup
 	wg.Add(numThreads)
@@ -94,28 +90,22 @@ func main() {
 	for i := 0; i < numThreads; i++ {
 		go func() {
 			defer wg.Done()
-			for params := range jobChan {
-				checkIPRange(params, ipChan)
+			for ipRange := range jobChan {
+				checker.checkIPRange(ipRange, logChan)
 			}
 		}()
 	}
 
 	go func() {
 		for _, prefix := range prefixes {
-			params := checkIPRangeParams{
-				ipRange:     prefix,
-				keywordList: keywordList,
-				timeout:     timeout,
-				verbose:     verbose,
-			}
-			jobChan <- params
+			jobChan <- prefix
 		}
 		close(jobChan)
 	}()
 
 	go func() {
 		wg.Wait()
-		close(ipChan)
+		close(logChan)
 	}()
 
 	var output *os.File
@@ -128,10 +118,10 @@ func main() {
 		defer output.Close()
 	}
 
-	for ip := range ipChan {
-		fmt.Print(ip)
+	for logStr := range logChan {
+		fmt.Print(logStr)
 		if output != nil {
-			_, err := output.WriteString(ip)
+			_, err := output.WriteString(logStr)
 			if err != nil {
 				log.Println("Error writing to output file:", err)
 			}
@@ -139,56 +129,78 @@ func main() {
 	}
 }
 
-func checkIPRange(params checkIPRangeParams, ipChan chan<- string) {
-	_, ipNet, err := net.ParseCIDR(params.ipRange)
+type cidrChecker struct {
+	KeywordFinder
+	dialer    *net.Dialer
+	tlsConfig *tls.Config
+}
+
+func newChecker(timeoutSeconds int, finder KeywordFinder) *cidrChecker {
+	return &cidrChecker{
+		KeywordFinder: finder,
+		dialer:        &net.Dialer{Timeout: time.Duration(timeoutSeconds) * time.Second},
+		tlsConfig:     &tls.Config{InsecureSkipVerify: true},
+	}
+}
+
+func (c *cidrChecker) checkIPRange(ipRange string, logChan chan<- string) {
+	_, ipNet, err := net.ParseCIDR(ipRange)
 	if err != nil {
 		return
 	}
 
 	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
-		found := false
-		matchedKeywords := []string{}
-		for _, keyword := range params.keywordList {
-			if checkSSLKeyword(ip.String(), keyword, params.timeout) {
-				matchedKeywords = append(matchedKeywords, keyword)
-				found = true
-			}
+		matchedKeywords, err := c.checkSSLKeywords(ip.String())
+		if err != nil {
+			// TODO: check timeout error
+			continue
 		}
 
-		if found {
+		if len(matchedKeywords) > 0 {
 			if len(matchedKeywords) > 20 {
-				ipChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(matchedKeywords))
+				logChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(matchedKeywords))
 			} else {
-				ipChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(matchedKeywords, ", "))
+				logChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(matchedKeywords, ", "))
 			}
-		} else if params.verbose {
-			if len(params.keywordList) > 20 {
-				ipChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(params.keywordList))
+		} else if verbose {
+			if len(c.Keywords()) > 20 {
+				logChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(c.Keywords()))
 			} else {
-				ipChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(params.keywordList, ", "))
+				logChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(c.Keywords(), ", "))
 			}
 		}
 	}
 }
 
-func checkSSLKeyword(ip, keyword string, timeout int) bool {
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: time.Duration(timeout) * time.Second}, "tcp", ip+":443", &tls.Config{InsecureSkipVerify: true})
+func (c *cidrChecker) findCertKeywords(cert *x509.Certificate) []string {
+	kws := c.FindKeywords(cert.Subject.CommonName)
+
+	for _, s := range cert.Subject.Organization {
+		kws = append(kws, c.FindKeywords(s)...)
+	}
+
+	for _, s := range cert.Subject.OrganizationalUnit {
+		kws = append(kws, c.FindKeywords(s)...)
+	}
+
+	return kws
+}
+
+func (c *cidrChecker) checkSSLKeywords(ip string) ([]string, error) {
+	conn, err := tls.DialWithDialer(c.dialer, "tcp", ip+":443", c.tlsConfig)
 	if err != nil {
-		return false
+		return nil, err
 	}
 	defer conn.Close()
 
 	certs := conn.ConnectionState().PeerCertificates
-	if len(certs) > 0 {
-		subject := certs[0].Subject
-		if strings.Contains(subject.CommonName, keyword) ||
-			strings.Contains(strings.Join(subject.Organization, " "), keyword) ||
-			strings.Contains(strings.Join(subject.OrganizationalUnit, " "), keyword) {
-			return true
+	for _, cert := range certs {
+		if res := c.findCertKeywords(cert); len(res) != 0 {
+			return res, nil
 		}
 	}
 
-	return false
+	return nil, nil
 }
 
 func incrementIP(ip net.IP) {
@@ -200,7 +212,31 @@ func incrementIP(ip net.IP) {
 	}
 }
 
+type regexFinder struct {
+	regexp.Regexp
+	keywods []string
+}
+
+func NewRegexFinder(kewords []string) *regexFinder {
+	reg := regexp.MustCompile(strings.Join(kewords, "|"))
+	return &regexFinder{*reg, kewords}
+}
+
+func (r *regexFinder) FindKeywords(s string) []string {
+	return r.FindAllString(s, 20)
+}
+
+func (r *regexFinder) Keywords() []string {
+	return r.keywods
+}
+
 func getAWSIpRangePrefixes(randomize bool) ([]string, error) {
+	type IPRange struct {
+		Prefixes []struct {
+			IPPrefix string `json:"ip_prefix"`
+		} `json:"prefixes"`
+	}
+
 	resp, err := http.Get("https://ip-ranges.amazonaws.com/ip-ranges.json")
 	if err != nil {
 		return nil, fmt.Errorf("Error fetching IP ranges: %w", err)
