@@ -74,31 +74,9 @@ func main() {
 		keywordList = []string{keyword}
 	}
 
-	resp, err := http.Get("https://ip-ranges.amazonaws.com/ip-ranges.json")
+	prefixes, err := getAWSIpRangePrefixes(randomize)
 	if err != nil {
-		log.Println("Error fetching IP ranges:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Println("Error reading response body:", err)
-		return
-	}
-
-	var ipRanges IPRange
-	err = json.Unmarshal(data, &ipRanges)
-	if err != nil {
-		log.Println("Error parsing JSON:", err)
-		return
-	}
-
-	if randomize {
-		rand.Seed(time.Now().UnixNano())
-		rand.Shuffle(len(ipRanges.Prefixes), func(i, j int) {
-			ipRanges.Prefixes[i], ipRanges.Prefixes[j] = ipRanges.Prefixes[j], ipRanges.Prefixes[i]
-		})
+		log.Fatal(err)
 	}
 
 	ipChan := make(chan string)
@@ -117,9 +95,9 @@ func main() {
 	}
 
 	go func() {
-		for _, prefix := range ipRanges.Prefixes {
+		for _, prefix := range prefixes {
 			params := checkIPRangeParams{
-				ipRange:     prefix.IPPrefix,
+				ipRange:     prefix,
 				keywordList: keywordList,
 				timeout:     timeout,
 				verbose:     verbose,
@@ -214,6 +192,39 @@ func incrementIP(ip net.IP) {
 			break
 		}
 	}
+}
+
+func getAWSIpRangePrefixes(randomize bool) ([]string, error) {
+	resp, err := http.Get("https://ip-ranges.amazonaws.com/ip-ranges.json")
+	if err != nil {
+		return nil, fmt.Errorf("Error fetching IP ranges: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading response body: %w", err)
+	}
+
+	var ipRanges IPRange
+	err = json.Unmarshal(data, &ipRanges)
+	if err != nil {
+		return nil, fmt.Errorf("Error parsing JSON: %w", err)
+	}
+
+	prefixes := make([]string, len(ipRanges.Prefixes))
+	for i, p := range ipRanges.Prefixes {
+		prefixes[i] = p.IPPrefix
+	}
+
+	if randomize {
+		rand.Seed(time.Now().UnixNano())
+		rand.Shuffle(len(prefixes), func(i, j int) {
+			prefixes[i], prefixes[j] = prefixes[j], prefixes[i]
+		})
+	}
+
+	return prefixes, nil
 }
 
 func readFileLines(filePath string) ([]string, error) {
