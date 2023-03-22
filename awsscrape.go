@@ -31,13 +31,14 @@ type checkIPRangeParams struct {
 }
 
 var (
-	wordlist   string
-	keyword    string
-	numThreads int
-	timeout    int
-	randomize  bool
-	outputFile string
-	verbose    bool
+	wordlist          string
+	keyword           string
+	numThreads        int
+	timeout           int
+	randomize         bool
+	outputFile        string
+	prefixesInputFile string
+	verbose           bool
 )
 
 func parseCommandLineArguments() {
@@ -50,6 +51,7 @@ func parseCommandLineArguments() {
 	flag.StringVar(&outputFile, "output", "", "Output file to save results")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose mode")
 	flag.BoolVar(&verbose, "v", false, "Enable verbose mode (short form)")
+	flag.StringVar(&prefixesInputFile, "ip-ranges", "", "File containing ip ranges (like a.b.c.d/m)")
 
 	flag.Parse()
 }
@@ -62,7 +64,7 @@ func main() {
 		return
 	}
 
-	var keywordList []string
+	var keywordList, prefixes []string
 	var err error
 
 	if wordlist != "" {
@@ -74,7 +76,11 @@ func main() {
 		keywordList = []string{keyword}
 	}
 
-	prefixes, err := getAWSIpRangePrefixes(randomize)
+	if prefixesInputFile != "" {
+		prefixes, err = readFileLines(prefixesInputFile)
+	} else {
+		prefixes, err = getAWSIpRangePrefixes(randomize)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
