@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -62,17 +63,12 @@ func main() {
 	}
 
 	var keywordList []string
+	var err error
+
 	if wordlist != "" {
-		keywords, err := ioutil.ReadFile(wordlist)
+		keywordList, err = readFileLines(wordlist)
 		if err != nil {
-			log.Println("Error reading wordlist file:", err)
-			return
-		}
-		lines := strings.Split(string(keywords), "\n")
-		for _, line := range lines {
-			if len(strings.TrimSpace(line)) > 0 {
-				keywordList = append(keywordList, line)
-			}
+			log.Fatalf("Error reading wordlist file: %v", err)
 		}
 	} else {
 		keywordList = []string{keyword}
@@ -218,4 +214,26 @@ func incrementIP(ip net.IP) {
 			break
 		}
 	}
+}
+
+func readFileLines(filePath string) ([]string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	lines := make([]string, 0)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		text := strings.TrimSpace(scanner.Text())
+		if text != "" {
+			lines = append(lines, text)
+		}
+	}
+
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("file '%s' was empty", filePath)
+	}
+	return lines, scanner.Err()
 }
