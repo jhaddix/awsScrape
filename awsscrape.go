@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,97 +13,80 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
 
-type IPRange struct {
-	Prefixes []struct {
-		IPPrefix string `json:"ip_prefix"`
-	} `json:"prefixes"`
+type KeywordFinder interface {
+	FindKeywords(string) []string
+	Keywords() []string
 }
 
-type checkIPRangeParams struct {
-	ipRange     string
-	keywordList []string
-	timeout     int
-	verbose     bool
-}
+var (
+	wordlist          string
+	keyword           string
+	numThreads        int
+	timeout           int
+	randomize         bool
+	outputFile        string
+	prefixesInputFile string
+	verbose           bool
+)
 
-func parseCommandLineArguments() (string, string, int, int, bool, string, bool) {
-	wordlist := flag.String("wordlist", "", "File containing keywords to search in SSL certificates")
-	shortWordlist := flag.String("w", "", "File containing keywords to search in SSL certificates (short form)")
-	keyword := flag.String("keyword", "", "Single keyword to search in SSL certificates")
-	numThreads := flag.Int("threads", 4, "Number of concurrent threads")
-	timeout := flag.Int("timeout", 1, "Timeout in seconds for SSL connection")
-	randomize := flag.Bool("randomize", false, "Randomize the order in which IP addresses are checked")
-	outputFile := flag.String("output", "", "Output file to save results")
-	verbose := flag.Bool("verbose", false, "Enable verbose mode")
-	flag.BoolVar(verbose, "v", false, "Enable verbose mode (short form)")
+func parseCommandLineArguments() {
+	flag.StringVar(&wordlist, "wordlist", "", "File containing keywords to search in SSL certificates")
+	flag.StringVar(&wordlist, "w", "", "File containing keywords to search in SSL certificates (short form)")
+	flag.StringVar(&keyword, "keyword", "", "Single keyword to search in SSL certificates")
+	flag.IntVar(&numThreads, "threads", 4, "Number of concurrent threads")
+	flag.IntVar(&timeout, "timeout", 1, "Timeout in seconds for SSL connection")
+	flag.BoolVar(&randomize, "randomize", false, "Randomize the order in which IP addresses are checked")
+	flag.StringVar(&outputFile, "output", "", "Output file to save results")
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose mode")
+	flag.BoolVar(&verbose, "v", false, "Enable verbose mode (short form)")
+	flag.StringVar(&prefixesInputFile, "ip-ranges", "", "File containing ip ranges (like a.b.c.d/m)")
+
 	flag.Parse()
-
-	if *wordlist == "" && *shortWordlist != "" {
-		*wordlist = *shortWordlist
-	}
-
-	return *wordlist, *keyword, *numThreads, *timeout, *randomize, *outputFile, *verbose
 }
 
 func main() {
-	wordlist, keyword, numThreads, timeout, randomize, outputFile, verbose := parseCommandLineArguments()
+	parseCommandLineArguments()
 
 	if wordlist == "" && keyword == "" {
 		fmt.Println("Usage: go run script.go [-wordlist=<your_keywords_file> | -keyword=<your_keyword>] [-threads=<num_threads>] [-timeout=<timeout_seconds>] [-randomize] [-output=<output_file>] [-verbose]")
 		return
 	}
 
-	var keywordList []string
+	var keywordList, prefixes []string
+	var err error
+
 	if wordlist != "" {
-		keywords, err := ioutil.ReadFile(wordlist)
+		keywordList, err = readFileLines(wordlist)
 		if err != nil {
-			log.Println("Error reading wordlist file:", err)
-			return
-		}
-		lines := strings.Split(string(keywords), "\n")
-		for _, line := range lines {
-			if len(strings.TrimSpace(line)) > 0 {
-				keywordList = append(keywordList, line)
-			}
+			log.Fatalf("Error reading wordlist file: %v", err)
 		}
 	} else {
 		keywordList = []string{keyword}
 	}
 
-	resp, err := http.Get("https://ip-ranges.amazonaws.com/ip-ranges.json")
-	if err != nil {
-		log.Println("Error fetching IP ranges:", err)
-		return
+	if prefixesInputFile != "" {
+		prefixes, err = readFileLines(prefixesInputFile)
+	} else {
+		prefixes, err = getAWSIpRangePrefixes()
 	}
-	defer resp.Body.Close()
-
-	data, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Println("Error reading response body:", err)
-		return
-	}
-
-	var ipRanges IPRange
-	err = json.Unmarshal(data, &ipRanges)
-	if err != nil {
-		log.Println("Error parsing JSON:", err)
-		return
+		log.Fatal(err)
 	}
 
 	if randomize {
-		rand.Seed(time.Now().UnixNano())
-		rand.Shuffle(len(ipRanges.Prefixes), func(i, j int) {
-			ipRanges.Prefixes[i], ipRanges.Prefixes[j] = ipRanges.Prefixes[j], ipRanges.Prefixes[i]
-		})
+		randomizeStrings(prefixes)
 	}
 
-	ipChan := make(chan string)
-	jobChan := make(chan checkIPRangeParams, numThreads)
+	checker := newChecker(timeout, NewRegexFinder(keywordList))
+
+	logChan := make(chan string)
+	jobChan := make(chan string, numThreads)
 
 	var wg sync.WaitGroup
 	wg.Add(numThreads)
@@ -109,28 +94,22 @@ func main() {
 	for i := 0; i < numThreads; i++ {
 		go func() {
 			defer wg.Done()
-			for params := range jobChan {
-				checkIPRange(params, ipChan)
+			for ipRange := range jobChan {
+				checker.checkIPRange(ipRange, logChan)
 			}
 		}()
 	}
 
 	go func() {
-		for _, prefix := range ipRanges.Prefixes {
-			params := checkIPRangeParams{
-				ipRange:     prefix.IPPrefix,
-				keywordList: keywordList,
-				timeout:     timeout,
-				verbose:     verbose,
-			}
-			jobChan <- params
+		for _, prefix := range prefixes {
+			jobChan <- prefix
 		}
 		close(jobChan)
 	}()
 
 	go func() {
 		wg.Wait()
-		close(ipChan)
+		close(logChan)
 	}()
 
 	var output *os.File
@@ -143,10 +122,10 @@ func main() {
 		defer output.Close()
 	}
 
-	for ip := range ipChan {
-		fmt.Print(ip)
+	for logStr := range logChan {
+		fmt.Print(logStr)
 		if output != nil {
-			_, err := output.WriteString(ip)
+			_, err := output.WriteString(logStr)
 			if err != nil {
 				log.Println("Error writing to output file:", err)
 			}
@@ -154,56 +133,80 @@ func main() {
 	}
 }
 
-func checkIPRange(params checkIPRangeParams, ipChan chan<- string) {
-	_, ipNet, err := net.ParseCIDR(params.ipRange)
+type cidrChecker struct {
+	KeywordFinder
+	dialer    *net.Dialer
+	tlsConfig *tls.Config
+}
+
+func newChecker(timeoutSeconds int, finder KeywordFinder) *cidrChecker {
+	return &cidrChecker{
+		KeywordFinder: finder,
+		dialer:        &net.Dialer{Timeout: time.Duration(timeoutSeconds) * time.Second},
+		tlsConfig:     &tls.Config{InsecureSkipVerify: true},
+	}
+}
+
+func (c *cidrChecker) checkIPRange(ipRange string, logChan chan<- string) {
+	_, ipNet, err := net.ParseCIDR(ipRange)
 	if err != nil {
 		return
 	}
 
 	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
-		found := false
-		matchedKeywords := []string{}
-		for _, keyword := range params.keywordList {
-			if checkSSLKeyword(ip.String(), keyword, params.timeout) {
-				matchedKeywords = append(matchedKeywords, keyword)
-				found = true
+		matchedKeywords, err := c.checkSSLKeywords(ip.String())
+		if err != nil {
+			if verbose {
+				fmt.Fprintln(os.Stderr, "Error in tls handshake:", err)
 			}
+			continue
 		}
 
-		if found {
+		if len(matchedKeywords) > 0 {
 			if len(matchedKeywords) > 20 {
-				ipChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(matchedKeywords))
+				logChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(matchedKeywords))
 			} else {
-				ipChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(matchedKeywords, ", "))
+				logChan <- fmt.Sprintf("Matched keywords found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(matchedKeywords, ", "))
 			}
-		} else if params.verbose {
-			if len(params.keywordList) > 20 {
-				ipChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(params.keywordList))
+		} else if verbose {
+			if len(c.Keywords()) > 20 {
+				logChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords checked: %d)\n", ip.String(), len(c.Keywords()))
 			} else {
-				ipChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(params.keywordList, ", "))
+				logChan <- fmt.Sprintf("No matched keyword found in SSL certificate for IP: %s (Keywords: %s)\n", ip.String(), strings.Join(c.Keywords(), ", "))
 			}
 		}
 	}
 }
 
-func checkSSLKeyword(ip, keyword string, timeout int) bool {
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: time.Duration(timeout) * time.Second}, "tcp", ip+":443", &tls.Config{InsecureSkipVerify: true})
+func (c *cidrChecker) findCertKeywords(cert *x509.Certificate) []string {
+	kws := c.FindKeywords(cert.Subject.CommonName)
+
+	for _, s := range cert.Subject.Organization {
+		kws = append(kws, c.FindKeywords(s)...)
+	}
+
+	for _, s := range cert.Subject.OrganizationalUnit {
+		kws = append(kws, c.FindKeywords(s)...)
+	}
+
+	return kws
+}
+
+func (c *cidrChecker) checkSSLKeywords(ip string) ([]string, error) {
+	conn, err := tls.DialWithDialer(c.dialer, "tcp", ip+":443", c.tlsConfig)
 	if err != nil {
-		return false
+		return nil, err
 	}
 	defer conn.Close()
 
 	certs := conn.ConnectionState().PeerCertificates
-	if len(certs) > 0 {
-		subject := certs[0].Subject
-		if strings.Contains(subject.CommonName, keyword) ||
-			strings.Contains(strings.Join(subject.Organization, " "), keyword) ||
-			strings.Contains(strings.Join(subject.OrganizationalUnit, " "), keyword) {
-			return true
+	for _, cert := range certs {
+		if res := c.findCertKeywords(cert); len(res) != 0 {
+			return res, nil
 		}
 	}
 
-	return false
+	return nil, nil
 }
 
 func incrementIP(ip net.IP) {
@@ -213,4 +216,83 @@ func incrementIP(ip net.IP) {
 			break
 		}
 	}
+}
+
+type regexFinder struct {
+	regexp.Regexp
+	keywods []string
+}
+
+func NewRegexFinder(kewords []string) *regexFinder {
+	reg := regexp.MustCompile(strings.Join(kewords, "|"))
+	return &regexFinder{*reg, kewords}
+}
+
+func (r *regexFinder) FindKeywords(s string) []string {
+	return r.FindAllString(s, 20)
+}
+
+func (r *regexFinder) Keywords() []string {
+	return r.keywods
+}
+
+func getAWSIpRangePrefixes() ([]string, error) {
+	type IPRange struct {
+		Prefixes []struct {
+			IPPrefix string `json:"ip_prefix"`
+		} `json:"prefixes"`
+	}
+
+	resp, err := http.Get("https://ip-ranges.amazonaws.com/ip-ranges.json")
+	if err != nil {
+		return nil, fmt.Errorf("Error fetching IP ranges: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading response body: %w", err)
+	}
+
+	var ipRanges IPRange
+	err = json.Unmarshal(data, &ipRanges)
+	if err != nil {
+		return nil, fmt.Errorf("Error parsing JSON: %w", err)
+	}
+
+	prefixes := make([]string, len(ipRanges.Prefixes))
+	for i, p := range ipRanges.Prefixes {
+		prefixes[i] = p.IPPrefix
+	}
+
+	return prefixes, nil
+}
+
+func randomizeStrings(s []string) {
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(s), func(i, j int) {
+		s[i], s[j] = s[j], s[i]
+	})
+}
+
+func readFileLines(filePath string) ([]string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	lines := make([]string, 0)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		text := strings.TrimSpace(scanner.Text())
+		if text != "" {
+			lines = append(lines, text)
+		}
+	}
+
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("file '%s' was empty", filePath)
+	}
+	return lines, scanner.Err()
 }
