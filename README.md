@@ -32,3 +32,11 @@ go run awsscrape.go -keyword=<KEYWORD>
 The script will parse the SSL certificates from the AWS IP ranges and display any matching your KEYWORD with the IP addresses of the matching certificates.
 
 Please note that iterating through all AWS IP addresses and checking SSL certificates WILL take a long time to complete.
+
+
+Disclaimer: Usage without a customers permission may constitute a violation of AWS AUP:
+
+* https://aws.amazon.com/security/penetration-testing/
+* https://aws.amazon.com/aup/
+
+Use Responsibly
