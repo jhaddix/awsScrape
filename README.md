@@ -33,6 +33,7 @@ The script will parse the SSL certificates from the AWS IP ranges and display an
 
 Please note that iterating through all AWS IP addresses and checking SSL certificates WILL take a long time to complete.
 
+=================================================================================================================================================
 
 Disclaimer: Usage without a customers permission may constitute a violation of AWS AUP:
 
