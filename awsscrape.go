@@ -19,6 +19,7 @@ import (
 type IPRange struct {
 	Prefixes []struct {
 		IPPrefix string `json:"ip_prefix"`
+		Service  string `json:"service"`
 	} `json:"prefixes"`
 }
 
@@ -93,10 +94,12 @@ func main() {
 		return
 	}
 
+	selectedIPRanges := filterIPRanges(ipRanges)
+
 	if randomize {
 		rand.Seed(time.Now().UnixNano())
-		rand.Shuffle(len(ipRanges.Prefixes), func(i, j int) {
-			ipRanges.Prefixes[i], ipRanges.Prefixes[j] = ipRanges.Prefixes[j], ipRanges.Prefixes[i]
+		rand.Shuffle(len(selectedIPRanges), func(i, j int) {
+			selectedIPRanges[i], selectedIPRanges[j] = selectedIPRanges[j], selectedIPRanges[i]
 		})
 	}
 
@@ -116,9 +119,9 @@ func main() {
 	}
 
 	go func() {
-		for _, prefix := range ipRanges.Prefixes {
+		for _, prefix := range selectedIPRanges {
 			params := checkIPRangeParams{
-				ipRange:     prefix.IPPrefix,
+				ipRange:     prefix,
 				keywordList: keywordList,
 				timeout:     timeout,
 				verbose:     verbose,
@@ -152,6 +155,17 @@ func main() {
 			}
 		}
 	}
+}
+
+func filterIPRanges(ipRanges IPRange) []string {
+	var selectedRanges []string
+
+	for _, ipRange := range ipRanges.Prefixes {
+		if ipRange.Service == "EC2" || ipRange.Service == "CLOUDFRONT" {
+			selectedRanges = append(selectedRanges, ipRange.IPPrefix)
+		}
+	}
+	return selectedRanges
 }
 
 func checkIPRange(params checkIPRangeParams, ipChan chan<- string) {
