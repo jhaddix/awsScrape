@@ -19,6 +19,7 @@ import (
 type IPRange struct {
 	Prefixes []struct {
 		IPPrefix string `json:"ip_prefix"`
+		Region   string `json:"region"`
 	} `json:"prefixes"`
 }
 
@@ -29,7 +30,8 @@ type checkIPRangeParams struct {
 	verbose     bool
 }
 
-func parseCommandLineArguments() (string, string, int, int, bool, string, bool) {
+func parseCommandLineArguments() (string, string, string, int, int, bool, string, bool) {
+	region := flag.String("region", "", "A specific AWS region")
 	wordlist := flag.String("wordlist", "", "File containing keywords to search in SSL certificates")
 	shortWordlist := flag.String("w", "", "File containing keywords to search in SSL certificates (short form)")
 	keyword := flag.String("keyword", "", "Single keyword to search in SSL certificates")
@@ -45,11 +47,11 @@ func parseCommandLineArguments() (string, string, int, int, bool, string, bool) 
 		*wordlist = *shortWordlist
 	}
 
-	return *wordlist, *keyword, *numThreads, *timeout, *randomize, *outputFile, *verbose
+	return *region, *wordlist, *keyword, *numThreads, *timeout, *randomize, *outputFile, *verbose
 }
 
 func main() {
-	wordlist, keyword, numThreads, timeout, randomize, outputFile, verbose := parseCommandLineArguments()
+	region, wordlist, keyword, numThreads, timeout, randomize, outputFile, verbose := parseCommandLineArguments()
 
 	if wordlist == "" && keyword == "" {
 		fmt.Println("Usage: go run script.go [-wordlist=<your_keywords_file> | -keyword=<your_keyword>] [-threads=<num_threads>] [-timeout=<timeout_seconds>] [-randomize] [-output=<output_file>] [-verbose]")
@@ -117,13 +119,15 @@ func main() {
 
 	go func() {
 		for _, prefix := range ipRanges.Prefixes {
-			params := checkIPRangeParams{
-				ipRange:     prefix.IPPrefix,
-				keywordList: keywordList,
-				timeout:     timeout,
-				verbose:     verbose,
+			if region == "" || region == prefix.Region {
+				params := checkIPRangeParams{
+					ipRange:     prefix.IPPrefix,
+					keywordList: keywordList,
+					timeout:     timeout,
+					verbose:     verbose,
+				}
+				jobChan <- params
 			}
-			jobChan <- params
 		}
 		close(jobChan)
 	}()
